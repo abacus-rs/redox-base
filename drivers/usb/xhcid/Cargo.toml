@@ -27,6 +27,9 @@ serde_json = "1"
 smallvec = { version = "1", features = ["serde"] }
 thiserror = "1"
 toml = "0.5"
+tock-registers = "0.10.0"
+power_states = { path = "abacus" }
+
 
 common = { path = "../../common" }
 daemon = { path = "../../../daemon" }

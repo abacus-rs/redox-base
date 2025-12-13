@@ -12,21 +12,26 @@
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs::File;
+use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use std::{mem, process, slice, thread};
 use syscall::error::{Error, Result, EBADF, EBADMSG, EIO, ENOENT};
 use syscall::{EAGAIN, PAGE_SIZE};
 
+use crate::xhci::port::{Disconnected, Enabled, PortFlags};
+use crate::xhci::power_manager::{StateEnum, SyncState, AbacusCell};
+
 use chashmap::CHashMap;
-use common::{dma::Dma, io::Io, timeout::Timeout};
+use common::{dma::Dma, io::Io};
 use crossbeam_channel::{Receiver, Sender};
 use log::{debug, error, info, trace, warn};
 use serde::Deserialize;
 
 use crate::usb;
 
+use pcid_interface::msi::{MsixInfo, MsixTableEntry};
 use pcid_interface::PciFunctionHandle;
 
 mod capability;
@@ -42,19 +47,17 @@ mod ring;
 mod runtime;
 pub mod scheme;
 mod trb;
+mod power_manager;
+
 
 pub use self::capability::CapabilityRegs;
-use self::context::{
-    DeviceContextList, InputContext, ScratchpadBufferArray, StreamContextArray,
-    SLOT_CONTEXT_STATE_MASK, SLOT_CONTEXT_STATE_SHIFT,
-};
-pub use self::context::{CONTEXT_32, CONTEXT_64};
+use self::context::{DeviceContextList, InputContext, ScratchpadBufferArray, StreamContextArray};
 use self::doorbell::Doorbell;
 use self::event::EventRing;
 use self::extended::{CapabilityId, ExtendedCapabilitiesIter, ProtocolSpeed, SupportedProtoCap};
 use self::irq_reactor::{EventDoorbell, IrqReactor, NewPendingTrb, RingId};
-use self::operational::*;
-use self::port::Port;
+use self::operational::OperationalRegs;
+use self::port::{PortRegisters, PortStore, Resetable, GetState};
 use self::ring::Ring;
 use self::runtime::RuntimeRegs;
 use self::trb::{TransferKind, Trb, TrbCompletionCode};
@@ -63,6 +66,11 @@ use self::scheme::EndpIfState;
 
 pub use crate::driver_interface::PortId;
 use crate::driver_interface::*;
+
+/// Context size options used by the daemon to choose 32- or 64-byte context
+/// data structures. These represent sizes in bytes.
+pub const CONTEXT_32: usize = 32;
+pub const CONTEXT_64: usize = 64;
 
 /// Specifies the configurable interrupt mechanism used by the xhci subsystem for registering
 /// device state change notifications.
@@ -73,11 +81,28 @@ pub enum InterruptMethod {
     /// Legacy PCI INTx# interrupt pin.
     Intx,
 
-    /// (Extended) Message signaled interrupts.
+    /// Message signaled interrupts.
     Msi,
+
+    /// Extended message signaled interrupts.
+    MsiX(Mutex<MappedMsixRegs>),
 }
 
-impl<const N: usize> Xhci<N> {
+pub struct MappedMsixRegs {
+    pub virt_table_base: NonNull<MsixTableEntry>,
+    pub info: MsixInfo,
+}
+impl MappedMsixRegs {
+    pub unsafe fn table_entry_pointer_unchecked(&mut self, k: usize) -> &mut MsixTableEntry {
+        &mut *self.virt_table_base.as_ptr().offset(k as isize)
+    }
+    pub fn table_entry_pointer(&mut self, k: usize) -> &mut MsixTableEntry {
+        assert!(k < self.info.table_size as usize);
+        unsafe { self.table_entry_pointer_unchecked(k) }
+    }
+}
+
+impl Xhci {
     /// Gets descriptors, before the port state is initiated.
     async fn get_desc_raw<T>(
         &self,
@@ -250,7 +275,7 @@ impl<const N: usize> Xhci<N> {
 }
 
 /// The eXtensible Host Controller Interface (XHCI) data structure
-pub struct Xhci<const N: usize> {
+pub struct Xhci {
     // immutable
     /// The Host Controller Interface Capability Registers. These read-only registers specify the
     /// limits and capabilities of the host controller implementation (See XHCI section 5.3)
@@ -262,7 +287,7 @@ pub struct Xhci<const N: usize> {
     /// The Host Controller Interface Operational Registers. These registers provide the software
     /// interface to configure and monitor the state of the XHCI (See XHCI section 5.4)
     op: Mutex<&'static mut OperationalRegs>,
-    ports: Mutex<&'static mut [Port]>,
+    ports: Mutex<&'static mut [AbacusCell<PortStore>]>,
     /// The Host Controller Interface Doorbell Registers. There is one register per device slot,
     /// and these registers are used by system software to notify the XHC that it has work to perform
     /// for a specific device slot. (See XHCI sections 4.7 and 5.6)
@@ -274,7 +299,7 @@ pub struct Xhci<const N: usize> {
     primary_event_ring: Mutex<EventRing>,
 
     // immutable
-    dev_ctx: DeviceContextList<N>,
+    dev_ctx: DeviceContextList,
     scratchpad_buf_arr: Option<ScratchpadBufferArray>,
 
     // used for the extended capabilities, and so far none of them are mutated, and thus no lock.
@@ -282,7 +307,7 @@ pub struct Xhci<const N: usize> {
 
     handles: CHashMap<usize, scheme::Handle>,
     next_handle: AtomicUsize,
-    port_states: CHashMap<PortId, PortState<N>>,
+    port_states: CHashMap<PortId, PortState>,
     drivers: CHashMap<PortId, Vec<process::Child>>,
     scheme_name: String,
 
@@ -301,19 +326,19 @@ pub struct Xhci<const N: usize> {
     device_enumerator_receiver: Receiver<DeviceEnumerationRequest>,
 }
 
-unsafe impl<const N: usize> Send for Xhci<N> {}
-unsafe impl<const N: usize> Sync for Xhci<N> {}
+unsafe impl Send for Xhci {}
+unsafe impl Sync for Xhci {}
 
-struct PortState<const N: usize> {
+struct PortState {
     slot: u8,
     protocol_speed: &'static ProtocolSpeed,
     cfg_idx: Option<u8>,
-    input_context: Mutex<Dma<InputContext<N>>>,
+    input_context: Mutex<Dma<InputContext>>,
     dev_desc: Option<DevDesc>,
     endpoint_states: BTreeMap<u8, EndpointState>,
 }
 
-impl<const N: usize> PortState<N> {
+impl PortState {
     //TODO: fetch using endpoint number instead
     fn get_endp_desc(&self, endp_idx: u8) -> Option<&EndpDesc> {
         let cfg_idx = self.cfg_idx?;
@@ -354,13 +379,13 @@ impl EndpointState {
     }
 }
 
-impl<const N: usize> Xhci<N> {
+impl Xhci {
     pub fn new(
         scheme_name: String,
         address: usize,
         interrupt_method: InterruptMethod,
         pcid_handle: PciFunctionHandle,
-    ) -> Result<Self> {
+    ) -> Result<Xhci> {
         //Locate the capability registers from the mapped PCI Bar
         let cap = unsafe { &mut *(address as *mut CapabilityRegs) };
         debug!("CAP REGS BASE {:X}", address);
@@ -374,42 +399,26 @@ impl<const N: usize> Xhci<N> {
 
         //Reset the XHCI device
         let (max_slots, max_ports) = {
-            {
-                debug!("Waiting for xHC becoming ready.");
-                let timeout = Timeout::from_secs(1);
-                while op.usb_sts.readf(USB_STS_CNR) {
-                    timeout.run().map_err(|()| {
-                        log::error!("timeout on USB_STS_CNR");
-                        Error::new(EIO)
-                    })?;
-                }
+            debug!("Waiting for xHC becoming ready.");
+            // Wait until controller is ready
+            while op.usb_sts.readf(1 << 11) {
+                trace!("Waiting for the xHC to be ready.");
             }
 
             debug!("Stopping the xHC");
             // Set run/stop to 0
-            op.usb_cmd.writef(USB_CMD_RS, false);
+            op.usb_cmd.writef(1, false);
 
-            {
-                debug!("Waiting for the xHC to stop.");
-                let timeout = Timeout::from_secs(1);
-                while !op.usb_sts.readf(USB_STS_HCH) {
-                    timeout.run().map_err(|()| {
-                        log::error!("timeout on USB_STS_HCH");
-                        Error::new(EIO)
-                    })?;
-                }
+            debug!("Waiting for the xHC to stop.");
+            // Wait until controller not running
+            while !op.usb_sts.readf(1) {
+                trace!("Waiting for the xHC to stop.");
             }
 
-            {
-                debug!("Resetting the xHC.");
-                op.usb_cmd.writef(USB_CMD_HCRST, true);
-                let timeout = Timeout::from_secs(1);
-                while op.usb_cmd.readf(USB_CMD_HCRST) {
-                    timeout.run().map_err(|()| {
-                        log::error!("timeout on USB_CMD_HCRST");
-                        Error::new(EIO)
-                    })?;
-                }
+            debug!("Resetting the xHC.");
+            op.usb_cmd.writef(1 << 1, true);
+            while op.usb_sts.readf(1 << 1) {
+                trace!("Waiting for the xHC to reset.");
             }
 
             debug!("Reading max slots.");
@@ -423,8 +432,22 @@ impl<const N: usize> Xhci<N> {
 
         //Get the address of the port register table
         let port_base = op_base + 0x400;
-        let ports =
-            unsafe { slice::from_raw_parts_mut(port_base as *mut Port, max_ports as usize) };
+        let mut ports = unsafe {
+
+            // Create an array of AbacusCell<PortStore> for each port
+            let mut ports: Vec<AbacusCell<PortStore>> = Vec::with_capacity(max_ports as usize);
+            for i in 0..max_ports as usize {
+                let port_addr = port_base + i * mem::size_of::<PortRegisters<Disconnected>>();
+                let raw_register = std::ptr::read(port_addr as *const PortRegisters<Disconnected>);
+                let cell = AbacusCell::new(PortStore::Disconnected(raw_register));
+                ports.push(cell);
+            }
+            // Convert the Vec into a boxed slice and then into a mutable reference to a slice
+            let boxed_slice = ports.into_boxed_slice();
+            let slice_ref: &mut [AbacusCell<PortStore>] = Box::leak(boxed_slice);
+            slice_ref
+         };
+
         debug!("PORT BASE {:X}", port_base);
 
         //Get the address of the dorbell register table
@@ -439,7 +462,7 @@ impl<const N: usize> Xhci<N> {
         // Create the command ring with 4096 / 16 (TRB size) entries, so that it uses all of the
         // DMA allocation (which is at least a 4k page).
         let entries_per_page = PAGE_SIZE / mem::size_of::<Trb>();
-        let cmd = Ring::new::<N>(cap.ac64(), entries_per_page, true)?;
+        let cmd = Ring::new(cap.ac64(), entries_per_page, true)?;
 
         let (irq_reactor_sender, irq_reactor_receiver) = crossbeam_channel::unbounded();
 
@@ -459,7 +482,7 @@ impl<const N: usize> Xhci<N> {
             scratchpad_buf_arr: None, // initialized in init()
 
             cmd: Mutex::new(cmd),
-            primary_event_ring: Mutex::new(EventRing::new::<N>(cap.ac64())?),
+            primary_event_ring: Mutex::new(EventRing::new(cap.ac64())?),
             handles: CHashMap::new(),
             next_handle: AtomicUsize::new(0),
             port_states: CHashMap::new(),
@@ -485,23 +508,13 @@ impl<const N: usize> Xhci<N> {
     pub fn init(&mut self, max_slots: u8) -> Result<()> {
         // Set run/stop to 0
         debug!("Stopping xHC.");
-        self.op.get_mut().unwrap().usb_cmd.writef(USB_CMD_RS, false);
+        self.op.get_mut().unwrap().usb_cmd.writef(1, false);
 
         // Warm reset
-        {
-            debug!("Reset xHC");
-            let timeout = Timeout::from_secs(1);
-            self.op
-                .get_mut()
-                .unwrap()
-                .usb_cmd
-                .writef(USB_CMD_HCRST, true);
-            while self.op.get_mut().unwrap().usb_cmd.readf(USB_CMD_HCRST) {
-                timeout.run().map_err(|()| {
-                    log::error!("timeout on USB_CMD_HCRST");
-                    Error::new(EIO)
-                })?;
-            }
+        debug!("Reset xHC");
+        self.op.get_mut().unwrap().usb_cmd.writef(1 << 1, true);
+        while self.op.get_mut().unwrap().usb_cmd.readf(1 << 1) {
+            thread::yield_now();
         }
 
         // Set enabled slots
@@ -561,51 +574,75 @@ impl<const N: usize> Xhci<N> {
             debug!("Enabling Primary Interrupter.");
             int.iman.writef(1 << 1 | 1, true);
         }
-        self.op
-            .get_mut()
-            .unwrap()
-            .usb_cmd
-            .writef(USB_CMD_INTE, true);
+        self.op.get_mut().unwrap().usb_cmd.writef(1 << 2, true);
 
         // Setup the scratchpad buffers that are required for the xHC to function.
         self.setup_scratchpads()?;
 
         // Set run/stop to 1
         debug!("Starting xHC.");
-        self.op.get_mut().unwrap().usb_cmd.writef(USB_CMD_RS, true);
+        self.op.get_mut().unwrap().usb_cmd.writef(1, true);
 
-        {
-            debug!("Waiting for start request to complete.");
-            let timeout = Timeout::from_secs(1);
-            while self.op.get_mut().unwrap().usb_sts.readf(USB_STS_HCH) {
-                timeout.run().map_err(|()| {
-                    log::error!("timeout on USB_STS_HCH");
-                    Error::new(EIO)
-                })?;
-            }
+        // Wait until controller is running
+        debug!("Waiting for start request to complete.");
+        while self.op.get_mut().unwrap().usb_sts.readf(1) {
+            trace!("Waiting for XHCI to report running status.");
         }
 
         // Ring command doorbell
         debug!("Ringing command doorbell.");
         self.dbs.lock().unwrap()[0].write(0);
 
-        info!("XHCI initialized.");
+          for _ in 0..100 {
+            let counter_start = start();
+            let counter_stop = stop();
+            info!("Init loop took {} cycles", counter_stop - counter_start);
+         }
+
+
+        info!("xhcid XHCI initialized.");
+
 
         self.op.get_mut().unwrap().set_cie(self.cap.cic());
 
+        info!("calling port capabilities");
         self.print_port_capabilities();
+
+        info!("done with port capabilities");
+
 
         Ok(())
     }
 
-    pub fn get_pls(&self, port_id: PortId) -> u8 {
-        let mut ports = self.ports.lock().unwrap();
-        let port = ports.get_mut(port_id.root_hub_port_index()).unwrap();
-        port.state()
+    pub fn get_pls(&self, port_id: PortId) -> Option<u8> {
+        let ports = self.ports.lock().unwrap();
+        let port_store = ports.get(port_id.root_hub_port_index())?;
+
+        port_store.map(|port|{
+         match port {
+             PortStore::Disabled(port) => {
+                let res = port.state();
+                 (port.into(), Some(res))
+             }
+             PortStore::Enabled(port) => {
+                let res = port.state();
+                 (port.into(), Some(res))
+             }
+             PortStore::Disconnected(port) => {
+                let res = port.state();
+                 (port.into(), Some(res))
+             }
+             PortStore::Reset(port) => {
+                 (port.into(), None)
+             }
+             PortStore::Off(port) => {
+                 (port.into(), None)
+             }
+         }})?
     }
 
     pub fn poll(&self) {
-        debug!("Polling Initial Devices!");
+        info!("Polling Initial Devices!");
 
         let len = self.ports.lock().unwrap().len();
 
@@ -615,30 +652,31 @@ impl<const N: usize> Xhci<N> {
                 route_string: 0,
             };
 
-            //Get the CCS and CSC flags
-            let (ccs, csc, flags) = {
-                let mut ports = self.ports.lock().unwrap();
-                let port = &mut ports[port_id.root_hub_port_index()];
-                let flags = port.flags();
-                let ccs = flags.contains(PortFlags::CCS);
-                let csc = flags.contains(PortFlags::CSC);
+            // Determine the port state.
+            let mut ports = self.ports.lock().unwrap();
 
-                (ccs, csc, flags)
-            };
-
-            debug!("Port {} has flags {:?}", port_id, flags);
-
-            match (ccs, csc) {
-                (false, false) => { // Nothing is connected, and there was no port status change
-                     //Do nothing
-                }
-                _ => {
-                    //Either something is connected, or nothing is connected and a port status change was asserted.
-                    self.device_enumerator_sender
-                        .send(DeviceEnumerationRequest { port_id })
-                        .expect("Failed to generate the port enumeration request!");
-                }
+             ports[port_id.root_hub_port_index()].map(|port_store| {
+            if port_id.root_hub_port_index() == 4 {
+             port_store.get_state();
             }
+                 debug!("calling sync state from poll");
+              let port_store = port_store.sync_state();
+             if let PortStore::Disabled(_) = &port_store {
+                 self.device_enumerator_sender
+                     .send(DeviceEnumerationRequest { port_id })
+                     .expect("Failed to generate the port enumeration request!");
+             } else if let PortStore::Enabled(_) = &port_store {
+                 self.device_enumerator_sender
+                     .send(DeviceEnumerationRequest { port_id })
+                     .expect("Failed to generate the port enumeration request!");
+             } else {
+                 // Do nothing; nothing is connected
+                 info!("Port {} is not connected; nothing to do.", port_id);
+             }
+
+             (port_store, ())
+
+             });
         }
     }
 
@@ -656,12 +694,6 @@ impl<const N: usize> Xhci<N> {
             };
 
             let state = self.get_pls(port_id);
-            let mut flags;
-            {
-                let mut ports = self.ports.lock().unwrap();
-
-                flags = ports[port_id.root_hub_port_index()].flags();
-            }
 
             match self.supported_protocol(port_id) {
                 None => {
@@ -669,44 +701,50 @@ impl<const N: usize> Xhci<N> {
                 }
                 Some(protocol) => {
                     info!(
-                        "Port {} is a USB {}.{} port with slot type {} and in current state {}: {:?}",
+                        "Port {} is a USB {}.{} port with slot type {} and in current state {:?}: N/A",
                         port_id,
                         protocol.rev_major(),
                         protocol.rev_minor(),
                         protocol.proto_slot_ty(),
                         state,
-                        flags
                     );
                 }
             };
         }
     }
-    pub fn reset_port(&self, port_id: PortId) -> Result<()> {
+    pub fn reset_port(&self, port: impl Resetable, port_id: PortId) -> PortStore {
         debug!("XHCI Port {} reset", port_id);
 
         //TODO handle the second unwrap
-        let mut ports = self.ports.lock().unwrap();
-        let port = ports.get_mut(port_id.root_hub_port_index()).unwrap();
+        // let mut ports = self.ports.lock().unwrap();
+        // let port = ports.get_mut(port_id.root_hub_port_index()).unwrap();
         let instant = std::time::Instant::now();
 
-        debug!("Port {} Link State: {}", port_id, port.state());
+        // info!("Port {} Link State: {}", port_id, port.state());
 
-        {
-            port.set_pr();
-            debug!(
-                "Flags after setting port {} reset: {:?}",
-                port_id,
-                port.flags()
-            );
-            let timeout = Timeout::from_secs(1);
-            while !port.flags().contains(port::PortFlags::PRC) {
-                timeout.run().map_err(|()| {
-                    log::error!("timeout on port {} PRC", port_id);
-                    Error::new(EIO)
-                })?;
+        let mut reset_port = port.into_reset();
+        debug!(
+            "Flags after setting port {} reset: N/A",
+            port_id,
+        );
+
+        loop {
+            match reset_port.sync_state() {
+                PortStore::Reset(port) => {
+                    reset_port = port; 
+                    debug!("port {} reset loop ran at least once!", port_id);
+                    if instant.elapsed().as_secs() >= 1 {
+                        warn!("timeout");
+                        return PortStore::Reset(reset_port);
+                    }
+                    std::thread::yield_now();
+                }
+                other => {
+                    return other;
+                }
             }
         }
-        Ok(())
+
     }
 
     pub fn setup_scratchpads(&mut self) -> Result<()> {
@@ -715,7 +753,7 @@ impl<const N: usize> Xhci<N> {
         if buf_count == 0 {
             return Ok(());
         }
-        let scratchpad_buf_arr = ScratchpadBufferArray::new::<N>(self.cap.ac64(), buf_count)?;
+        let scratchpad_buf_arr = ScratchpadBufferArray::new(self.cap.ac64(), buf_count)?;
         self.dev_ctx.dcbaa[0] = scratchpad_buf_arr.register() as u64;
         debug!(
             "Setting up {} scratchpads, at {:#0x}",
@@ -774,8 +812,7 @@ impl<const N: usize> Xhci<N> {
     }
 
     pub fn slot_state(&self, slot: usize) -> u8 {
-        ((self.dev_ctx.contexts[slot].slot.d.read() & SLOT_CONTEXT_STATE_MASK)
-            >> SLOT_CONTEXT_STATE_SHIFT) as u8
+        self.dev_ctx.contexts[slot].slot.state()
     }
     pub unsafe fn alloc_dma_zeroed_raw<T>(_ac64: bool) -> Result<Dma<T>> {
         // TODO: ac64
@@ -792,23 +829,16 @@ impl<const N: usize> Xhci<N> {
         Self::alloc_dma_zeroed_unsized_raw(self.cap.ac64(), count)
     }
 
-    pub async fn attach_device(&self, port_id: PortId) -> syscall::Result<()> {
+    pub async fn attach_device(&self, port_id: PortId, port: PortRegisters<Enabled>) -> syscall::Result<PortStore> {
         if self.port_states.contains_key(&port_id) {
-            debug!("Already contains port {}", port_id);
+            println!("Already contains port {}", port_id);
             return Err(syscall::Error::new(EAGAIN));
         }
 
-        let (data, state, speed, flags) = {
-            let port = &self.ports.lock().unwrap()[port_id.root_hub_port_index()];
-            (port.read(), port.state(), port.speed(), port.flags())
+        let speed = {
+            port.speed()
         };
 
-        info!(
-            "XHCI Port {}: {:X}, State {}, Speed {}, Flags {:?}",
-            port_id, data, state, speed, flags
-        );
-
-        if flags.contains(port::PortFlags::CCS) {
             let slot_ty = match self.supported_protocol(port_id) {
                 Some(protocol) => protocol.proto_slot_ty(),
                 None => {
@@ -827,18 +857,18 @@ impl<const N: usize> Xhci<N> {
                 }
             };
 
-            debug!("Enabled port {}, which the xHC mapped to {}", port_id, slot);
+            info!("Enabled port {}, which the xHC mapped to {}", port_id, slot);
 
             //TODO: get correct speed for child devices
             let protocol_speed = self
                 .lookup_psiv(port_id, speed)
                 .expect("Failed to retrieve speed ID");
 
-            let mut input = unsafe { self.alloc_dma_zeroed::<InputContext<N>>()? };
+            let mut input = unsafe { self.alloc_dma_zeroed::<InputContext>()? };
 
             info!("Attempting to address the device");
             let mut ring = match self
-                .address_device(&mut input, port_id, slot_ty, slot, protocol_speed, speed)
+                .address_device(&mut input, port_id, slot_ty, slot, protocol_speed)
                 .await
             {
                 Ok(device_ring) => device_ring,
@@ -883,7 +913,7 @@ impl<const N: usize> Xhci<N> {
 
             debug!("Got the 8 byte dev descriptor: {:X?}", dev_desc_8_byte);
 
-            let dev_desc = self.get_desc(port_id, slot).await?;
+            let (dev_desc, portstore) = self.get_desc(port_id, slot, port.sync_state()).await?;
             debug!("Got the full device descriptor!");
             self.port_states.get_mut(&port_id).unwrap().dev_desc = Some(dev_desc);
 
@@ -907,11 +937,8 @@ impl<const N: usize> Xhci<N> {
                     error!("Failed to spawn driver for port {}: `{}`", port_id, err)
                 }
             }
-        } else {
-            warn!("Attempted to attach a device that didnt have CCS=1");
-        }
 
-        Ok(())
+        Ok(portstore)
     }
 
     pub async fn detach_device(&self, port_id: PortId) -> Result<()> {
@@ -924,7 +951,7 @@ impl<const N: usize> Xhci<N> {
                         match child.try_wait() {
                             Ok(status_opt) => match status_opt {
                                 Some(status) => {
-                                    debug!(
+                                    info!(
                                         "driver process {} for port {} exited with status {}",
                                         child.id(),
                                         port_id,
@@ -933,7 +960,7 @@ impl<const N: usize> Xhci<N> {
                                 }
                                 None => {
                                     //TODO: kill harder
-                                    warn!(
+                                    info!(
                                         "driver process {} for port {} still running",
                                         child.id(),
                                         port_id
@@ -941,7 +968,7 @@ impl<const N: usize> Xhci<N> {
                                 }
                             },
                             Err(err) => {
-                                warn!(
+                                info!(
                                     "failed to wait for the driver process {} for port {}: {}",
                                     child.id(),
                                     port_id,
@@ -963,16 +990,16 @@ impl<const N: usize> Xhci<N> {
         }
 
         if let Some(state) = self.port_states.remove(&port_id) {
-            debug!("disabling port slot {} for port {}", state.slot, port_id);
+            info!("disabling port slot {} for port {}", state.slot, port_id);
             let result = self.disable_port_slot(state.slot).await;
-            debug!(
+            info!(
                 "disabled port slot {} for port {} with result: {:?}",
                 state.slot, port_id, result
             );
 
             result
         } else {
-            debug!(
+            warn!(
                 "Attempted to detach from port {}, which wasn't previously attached.",
                 port_id
             );
@@ -982,7 +1009,7 @@ impl<const N: usize> Xhci<N> {
 
     pub async fn update_max_packet_size(
         &self,
-        input_context: &mut Dma<InputContext<N>>,
+        input_context: &mut Dma<InputContext>,
         slot_id: u8,
         dev_desc: usb::DeviceDescriptor8Byte,
     ) -> Result<()> {
@@ -993,10 +1020,11 @@ impl<const N: usize> Xhci<N> {
             // For later USB versions, packet_size is the shift
             1u32 << dev_desc.packet_size
         };
-        let mut b = input_context.device.endpoints[0].b.read();
+        let endp_ctx = &mut input_context.device.endpoints[0];
+        let mut b = endp_ctx.b.read();
         b &= 0x0000_FFFF;
         b |= (new_max_packet_size) << 16;
-        input_context.device.endpoints[0].b.write(b);
+        endp_ctx.b.write(b);
 
         let (event_trb, command_trb) = self
             .execute_command(|trb, cycle| {
@@ -1012,7 +1040,7 @@ impl<const N: usize> Xhci<N> {
 
     pub async fn update_default_control_pipe(
         &self,
-        input_context: &mut Dma<InputContext<N>>,
+        input_context: &mut Dma<InputContext>,
         slot_id: u8,
         dev_desc: &DevDesc,
     ) -> Result<()> {
@@ -1027,10 +1055,11 @@ impl<const N: usize> Xhci<N> {
             // For later USB versions, packet_size is the shift
             1u32 << dev_desc.packet_size
         };
-        let mut b = input_context.device.endpoints[0].b.read();
+        let endp_ctx = &mut input_context.device.endpoints[0];
+        let mut b = endp_ctx.b.read();
         b &= 0x0000_FFFF;
         b |= (new_max_packet_size) << 16;
-        input_context.device.endpoints[0].b.write(b);
+        endp_ctx.b.write(b);
 
         let (event_trb, command_trb) = self
             .execute_command(|trb, cycle| {
@@ -1047,12 +1076,11 @@ impl<const N: usize> Xhci<N> {
 
     pub async fn address_device(
         &self,
-        input_context: &mut Dma<InputContext<N>>,
+        input_context: &mut Dma<InputContext>,
         port: PortId,
         slot_ty: u8,
         slot: u8,
         protocol_speed: &ProtocolSpeed,
-        speed: u8,
     ) -> Result<Ring> {
         // Collect MTT, parent port number, parent slot ID
         let mut mtt = false;
@@ -1084,19 +1112,20 @@ impl<const N: usize> Xhci<N> {
             }
         }
 
-        let mut ring = Ring::new::<N>(self.cap.ac64(), 16, true)?;
+        let mut ring = Ring::new(self.cap.ac64(), 16, true)?;
 
         {
             input_context.add_context.write(1 << 1 | 1); // Enable the slot (zeroth bit) and the control endpoint (first bit).
+
+            let slot_ctx = &mut input_context.device.slot;
 
             let route_string = port.route_string;
             let context_entries = 1u8;
             let hub = false;
 
             assert_eq!(route_string & 0x000F_FFFF, route_string);
-            input_context.device.slot.a.write(
+            slot_ctx.a.write(
                 route_string
-                    | (u32::from(speed) << 20)
                     | (u32::from(mtt) << 25)
                     | (u32::from(hub) << 26)
                     | (u32::from(context_entries) << 27),
@@ -1105,7 +1134,7 @@ impl<const N: usize> Xhci<N> {
             let max_exit_latency = 0u16;
             let root_hub_port_num = port.root_hub_port_num;
             let number_of_ports = 0u8;
-            input_context.device.slot.b.write(
+            slot_ctx.b.write(
                 u32::from(max_exit_latency)
                     | (u32::from(root_hub_port_num) << 16)
                     | (u32::from(number_of_ports) << 24),
@@ -1116,28 +1145,33 @@ impl<const N: usize> Xhci<N> {
             let interrupter = 0u8;
 
             assert_eq!(ttt & 0b11, ttt);
-            input_context.device.slot.c.write(
+            slot_ctx.c.write(
                 u32::from(parent_hub_slot_id)
                     | (u32::from(parent_port_num) << 8)
                     | (u32::from(ttt) << 16)
                     | (u32::from(interrupter) << 22),
             );
 
+            let endp_ctx = &mut input_context.device.endpoints[0];
+
             let max_error_count = 3u8; // recommended value according to the XHCI spec
             let ep_ty = 4u8; // control endpoint, bidirectional
-            let max_packet_size: u32 =
-                if protocol_speed.is_lowspeed() || protocol_speed.is_fullspeed() {
-                    8
-                } else if protocol_speed.is_highspeed() {
-                    64
-                } else {
-                    512
-                };
+            let max_packet_size: u32 = if protocol_speed.is_lowspeed() {
+                8 // only valid value
+            } else if protocol_speed.is_fullspeed() {
+                64 // valid values are 8, 16, 32, 64
+            } else if protocol_speed.is_highspeed() {
+                64 // only valid value
+            } else if protocol_speed.is_superspeed_gen_x() {
+                512 // only valid value
+            } else {
+                unreachable!()
+            };
             let host_initiate_disable = false; // only applies to streams
             let max_burst_size = 0u8; // TODO
 
             assert_eq!(max_error_count & 0b11, max_error_count);
-            input_context.device.endpoints[0].b.write(
+            endp_ctx.b.write(
                 (u32::from(max_error_count) << 1)
                     | (u32::from(ep_ty) << 3)
                     | (u32::from(host_initiate_disable) << 7)
@@ -1145,20 +1179,9 @@ impl<const N: usize> Xhci<N> {
                     | (u32::from(max_packet_size) << 16),
             );
 
-            let dequeue_cycle_state = true;
             let tr = ring.register();
-            input_context.device.endpoints[0]
-                .trh
-                .write((tr >> 32) as u32);
-            input_context.device.endpoints[0]
-                .trl
-                .write((tr as u32) | u32::from(dequeue_cycle_state));
-
-            // The default control pipe can always use 8 bytes
-            let avg_trb_len = 8u8;
-            input_context.device.endpoints[0]
-                .c
-                .write(u32::from(avg_trb_len));
+            endp_ctx.trh.write((tr >> 32) as u32);
+            endp_ctx.trl.write(tr as u32);
         }
 
         let input_context_physical = input_context.physical();
@@ -1184,8 +1207,32 @@ impl<const N: usize> Xhci<N> {
         Ok(ring)
     }
 
-    fn uses_msi_interrupts(&self) -> bool {
-        matches!(self.interrupt_method, InterruptMethod::Msi)
+    pub fn uses_msi(&self) -> bool {
+        if let InterruptMethod::Msi = self.interrupt_method {
+            true
+        } else {
+            false
+        }
+    }
+    pub fn uses_msix(&self) -> bool {
+        if let InterruptMethod::MsiX(_) = self.interrupt_method {
+            true
+        } else {
+            false
+        }
+    }
+    // TODO: Perhaps use an rwlock?
+    pub fn msix_info(&self) -> Option<MutexGuard<'_, MappedMsixRegs>> {
+        match self.interrupt_method {
+            InterruptMethod::MsiX(ref info) => Some(info.lock().unwrap()),
+            _ => None,
+        }
+    }
+    pub fn msix_info_mut(&self) -> Option<MutexGuard<'_, MappedMsixRegs>> {
+        match self.interrupt_method {
+            InterruptMethod::MsiX(ref info) => Some(info.lock().unwrap()),
+            _ => None,
+        }
     }
 
     /// Checks whether an IRQ has been received from *this* device, in case of an interrupt. Always
@@ -1193,20 +1240,20 @@ impl<const N: usize> Xhci<N> {
     pub fn received_irq(&self) -> bool {
         let mut runtime_regs = self.run.lock().unwrap();
 
-        if self.uses_msi_interrupts() {
+        if self.uses_msi() || self.uses_msix() {
             // Since using MSI and MSI-X implies having no IRQ sharing whatsoever, the IP bit
             // doesn't have to be touched.
             trace!(
                 "Successfully received MSI/MSI-X interrupt, IP={}, EHB={}",
                 runtime_regs.ints[0].iman.readf(1),
-                runtime_regs.ints[0].erdp_low.readf(1 << 3)
+                runtime_regs.ints[0].erdp_low.readf(3)
             );
             true
         } else if runtime_regs.ints[0].iman.readf(1) {
             trace!(
                 "Successfully received INTx# interrupt, IP={}, EHB={}",
                 runtime_regs.ints[0].iman.readf(1),
-                runtime_regs.ints[0].erdp_low.readf(1 << 3)
+                runtime_regs.ints[0].erdp_low.readf(3)
             );
             // If MSI and/or MSI-X are not used, the interrupt might have to be shared, and thus there is
             // a special register to specify whether the IRQ actually came from the xHC.
@@ -1437,7 +1484,7 @@ impl<const N: usize> Xhci<N> {
             .find(|speed| speed.psiv() == psiv)
     }
 }
-pub fn start_irq_reactor<const N: usize>(hci: &Arc<Xhci<N>>, irq_file: Option<File>) {
+pub fn start_irq_reactor(hci: &Arc<Xhci>, irq_file: Option<File>) {
     let hci_clone = Arc::clone(&hci);
 
     debug!("About to start IRQ reactor");
@@ -1448,7 +1495,7 @@ pub fn start_irq_reactor<const N: usize>(hci: &Arc<Xhci<N>>, irq_file: Option<Fi
     }));
 }
 
-pub fn start_device_enumerator<const N: usize>(hci: &Arc<Xhci<N>>) {
+pub fn start_device_enumerator(hci: &Arc<Xhci>) {
     let hci_clone = Arc::clone(&hci);
 
     debug!("About to start Device Enumerator");
@@ -1477,7 +1524,6 @@ struct DriversConfig {
 }
 
 use crate::xhci::device_enumerator::{DeviceEnumerationRequest, DeviceEnumerator};
-use crate::xhci::port::PortFlags;
 use lazy_static::lazy_static;
 
 lazy_static! {
@@ -1488,3 +1534,57 @@ lazy_static! {
         toml::from_slice::<DriversConfig>(TOML).expect("Failed to parse internally embedded config file")
     };
 }
+
+
+use std::arch::asm;
+// Measurements
+use std::fs::{OpenOptions};
+use std::io::Write;
+
+
+#[inline(always)]
+pub fn start() -> u64 { 
+    let rax: u64;
+    unsafe {
+        asm!(
+            "mfence",
+            "lfence",
+            "rdtsc",
+            "shl rdx, 32",
+            "or rax, rdx",
+            out("rax") rax
+        );
+    }
+    rax
+}
+
+#[inline(always)]
+pub fn stop() -> u64 {
+    let rax: u64;
+    unsafe {
+        asm!(
+            "rdtsc",
+            "lfence",
+            "shl rdx, 32",
+            "or rax, rdx",
+            out("rax") rax
+        );
+    }
+
+    rax
+}
+/// Computes the difference between two cycle counts and logs the result to /home/user/cycle_result.csv with funct
+/// If the file does not exist, it will be created.
+pub fn log_cycle_difference_with_name(function_name: &str, counter_start: u64, counter_stop: u64) {
+    let nb_cycles = counter_stop - counter_start;
+    let path = "/home/user/cycle_result.csv";
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    .expect("Unable to open or create cycle_result.csv");
+    writeln!(file, "{},{}", function_name, nb_cycles)
+    .expect("Unable to write to cycle_result.csv");
+    log::info!("{} took {} cycles", function_name, nb_cycles);
+}
+

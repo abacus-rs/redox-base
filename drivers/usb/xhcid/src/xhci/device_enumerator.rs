@@ -1,5 +1,6 @@
 use crate::xhci::port::PortFlags;
-use crate::xhci::{PortId, Xhci};
+use crate::xhci::power_manager::Store;
+use crate::xhci::{PortId, Xhci, PortStore};
 use common::io::Io;
 use crossbeam_channel;
 use log::{debug, info, warn};
@@ -7,17 +8,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use syscall::EAGAIN;
 
+
+
+use tock_registers::interfaces::Readable;
+
+
 pub struct DeviceEnumerationRequest {
     pub port_id: PortId,
 }
 
-pub struct DeviceEnumerator<const N: usize> {
-    hci: Arc<Xhci<N>>,
+pub struct DeviceEnumerator {
+    hci: Arc<Xhci>,
     request_queue: crossbeam_channel::Receiver<DeviceEnumerationRequest>,
 }
 
-impl<const N: usize> DeviceEnumerator<N> {
-    pub fn new(hci: Arc<Xhci<N>>) -> Self {
+impl DeviceEnumerator {
+    pub fn new(hci: Arc<Xhci>) -> Self {
         let request_queue = hci.device_enumerator_receiver.clone();
         DeviceEnumerator { hci, request_queue }
     }
@@ -35,107 +41,75 @@ impl<const N: usize> DeviceEnumerator<N> {
             let port_id = request.port_id;
             let port_array_index = port_id.root_hub_port_index();
 
-            debug!("Device Enumerator request for port {}", port_id);
+            info!("Device Enumerator request for port {}", port_id);
 
-            let (len, flags) = {
-                let ports = self.hci.ports.lock().unwrap();
+            let ports = self.hci.ports.lock().unwrap();
 
-                let len = ports.len();
-
-                if port_array_index >= len {
+            let len = ports.len();
+        
+            if port_array_index >= len {
                     warn!(
                         "Received out of bounds Device Enumeration request for port {}",
                         port_id
                     );
                     continue;
-                }
+                } 
 
-                (len, ports[port_array_index].flags())
+
+            ports[port_array_index].map(|port_store|{ 
+                let port = if let PortStore::Disabled(port) = port_store {
+                    // let start = crate::xhci::start();
+                    let reset_result = self.hci.reset_port(port, port_id);
+                    // let stop = crate::xhci::stop();
+                    // crate::xhci::log_cycle_difference_with_name("reset port", start, stop);
+                    std::thread::sleep(Duration::from_millis(16)); //Some controllers need some extra time to make the transition.
+                    if let PortStore::Enabled(port) = reset_result {
+                        info!("xhcid Port {} was reset", port_id); 
+                        // continue
+                        port
+                    } else {
+                        info!("Port {} is not in a valid state after reset", port_id);
+                       return (reset_result, ())
+                    }
+                } else if let PortStore::Enabled(port) = port_store {
+                    // continue
+                    port
+                } else {
+                    info!("Received Device Enumeration request for port {} which is not in a valid state", port_id);
+                    return (port_store, ())
+                };
+
+            let block = {
+                let start = crate::xhci::start();
+                let res = self.hci.attach_device(port_id, port);
+                let stop = crate::xhci::stop();
+                crate::xhci::log_cycle_difference_with_name("attach_device", start, stop);
+                res
             };
 
-            if flags.contains(PortFlags::CCS) {
-                debug!(
-                    "Received Device Connect Port Status Change Event with port flags {:?}",
-                    flags
-                );
-                //If the port isn't enabled (i.e. it's a USB2 port), we need to reset it if it isn't resetting already
-                //A USB3 port won't generate a Connect Status Change until it's already enabled, so this check
-                //will always be skipped for USB3 ports
-                if !flags.contains(PortFlags::PED) {
-                    let disabled_state = flags.contains(PortFlags::PP)
-                        && flags.contains(PortFlags::CCS)
-                        && !flags.contains(PortFlags::PED)
-                        && !flags.contains(PortFlags::PR);
-
-                    if !disabled_state {
-                        panic!(
-                            "Port {} isn't in the disabled state! Current flags: {:?}",
-                            port_id, flags
-                        );
-                    } else {
-                        debug!("Port {} has entered the disabled state.", port_id);
-                    }
-
-                    //THIS LOCKS THE PORTS. DO NOT LOCK PORTS BEFORE THIS POINT
-                    info!("Received a device connect on port {}, but it's not enabled. Resetting the port.", port_id);
-                    let _ = self.hci.reset_port(port_id);
-
-                    let mut ports = self.hci.ports.lock().unwrap();
-                    let port = &mut ports[port_array_index];
-
-                    port.clear_prc();
-
-                    std::thread::sleep(Duration::from_millis(16)); //Some controllers need some extra time to make the transition.
-
-                    let flags = port.flags();
-
-                    let enabled_state = flags.contains(PortFlags::PP)
-                        && flags.contains(PortFlags::CCS)
-                        && flags.contains(PortFlags::PED)
-                        && !flags.contains(PortFlags::PR);
-
-                    if !enabled_state {
-                        warn!(
-                            "Port {} isn't in the enabled state! Current flags: {:?}",
-                            port_id, flags
-                        );
-                    } else {
-                        debug!(
-                            "Port {} is in the enabled state. Proceeding with enumeration",
-                            port_id
-                        );
-                    }
-                }
-
-                let result = futures::executor::block_on(self.hci.attach_device(port_id));
-                match result {
-                    Ok(_) => {
+            //let start = crate::xhci::start();
+            let result = futures::executor::block_on(block);
+            //let stop = crate::xhci::stop();
+            //crate::xhci::log_cycle_difference_with_name("attach device", start, stop);
+            match result {
+                Ok(port) => {
                         info!("Device on port {} was attached", port_id);
-                    }
-                    Err(err) => {
-                        if err.errno == EAGAIN {
-                            debug!("Received a device connect notification for an already connected device. Ignoring...")
-                        } else {
-                            warn!("processing of device attach request failed! Error: {}", err);
-                        }
-                    }
+                        return (port, ())
                 }
-            } else {
-                debug!(
-                    "Device Enumerator received Detach request on port {} which is in state {}",
-                    port_id,
-                    self.hci.get_pls(port_id)
-                );
-                let result = futures::executor::block_on(self.hci.detach_device(port_id));
-                match result {
-                    Ok(_) => {
-                        info!("Device on port {} was detached", port_id);
-                    }
-                    Err(err) => {
-                        warn!("processing of device attach request failed! Error: {}", err);
-                    }
+                Err(err) => {
+                    unimplemented!("Error attaching device on port {}: {}", port_id, err);
+                    // if err.errno == EAGAIN {
+                    //         info!("Received a device connect notification for an already connected device. Ignoring...")
+                    // } else {
+                    // //        warn!("processing of device attach request failed! Error: {}", err);
+                    // }
                 }
             }
+
+
+            }).unwrap();
+
+
         }
     }
 }
