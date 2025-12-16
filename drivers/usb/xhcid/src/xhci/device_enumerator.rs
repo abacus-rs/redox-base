@@ -1,5 +1,5 @@
 use crate::xhci::port::PortFlags;
-use crate::xhci::{PortId, Xhci};
+use crate::xhci::{log_cycle_difference_with_name, PortId, Xhci};
 use common::io::Io;
 use crossbeam_channel;
 use log::{debug, info, warn};
@@ -11,13 +11,13 @@ pub struct DeviceEnumerationRequest {
     pub port_id: PortId,
 }
 
-pub struct DeviceEnumerator<const N: usize> {
-    hci: Arc<Xhci<N>>,
+pub struct DeviceEnumerator {
+    hci: Arc<Xhci>,
     request_queue: crossbeam_channel::Receiver<DeviceEnumerationRequest>,
 }
 
-impl<const N: usize> DeviceEnumerator<N> {
-    pub fn new(hci: Arc<Xhci<N>>) -> Self {
+impl DeviceEnumerator {
+    pub fn new(hci: Arc<Xhci>) -> Self {
         let request_queue = hci.device_enumerator_receiver.clone();
         DeviceEnumerator { hci, request_queue }
     }
@@ -35,7 +35,7 @@ impl<const N: usize> DeviceEnumerator<N> {
             let port_id = request.port_id;
             let port_array_index = port_id.root_hub_port_index();
 
-            debug!("Device Enumerator request for port {}", port_id);
+            info!("Device Enumerator request for port {}", port_id);
 
             let (len, flags) = {
                 let ports = self.hci.ports.lock().unwrap();
@@ -54,7 +54,7 @@ impl<const N: usize> DeviceEnumerator<N> {
             };
 
             if flags.contains(PortFlags::CCS) {
-                debug!(
+                info!(
                     "Received Device Connect Port Status Change Event with port flags {:?}",
                     flags
                 );
@@ -78,7 +78,10 @@ impl<const N: usize> DeviceEnumerator<N> {
 
                     //THIS LOCKS THE PORTS. DO NOT LOCK PORTS BEFORE THIS POINT
                     info!("Received a device connect on port {}, but it's not enabled. Resetting the port.", port_id);
-                    let _ = self.hci.reset_port(port_id);
+                    //let start = crate::xhci::start();
+                    self.hci.reset_port(port_id);
+                    //let stop = crate::xhci::stop();
+                    //log_cycle_difference_with_name("reset port", start, stop);
 
                     let mut ports = self.hci.ports.lock().unwrap();
                     let port = &mut ports[port_array_index];
@@ -106,29 +109,32 @@ impl<const N: usize> DeviceEnumerator<N> {
                         );
                     }
                 }
-     let block = {
-                let start = crate::xhci::start();
-                let res = self.hci.attach_device(port_id);
-                let stop = crate::xhci::stop();
-                crate::xhci::log_cycle_difference_with_name("attach_device", start, stop);
-                res
-            };
 
+                let block = {
+                    let start = crate::xhci::start();
+                    let res = self.hci.attach_device(port_id);
+                    let stop = crate::xhci::stop();
+                    log_cycle_difference_with_name("attach_device", start, stop);
+                    res
+                };
                 let result = futures::executor::block_on(block);
+                //let end = crate::xhci::stop();
+                //log_cycle_difference_with_name("attach device", start, end);
+                
                 match result {
                     Ok(_) => {
                         info!("Device on port {} was attached", port_id);
                     }
                     Err(err) => {
                         if err.errno == EAGAIN {
-                            debug!("Received a device connect notification for an already connected device. Ignoring...")
+                            info!("Received a device connect notification for an already connected device. Ignoring...")
                         } else {
                             warn!("processing of device attach request failed! Error: {}", err);
                         }
                     }
                 }
             } else {
-                debug!(
+                info!(
                     "Device Enumerator received Detach request on port {} which is in state {}",
                     port_id,
                     self.hci.get_pls(port_id)

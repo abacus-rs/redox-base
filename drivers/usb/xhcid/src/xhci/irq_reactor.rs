@@ -92,8 +92,8 @@ impl StateKind {
     }
 }
 
-pub struct IrqReactor<const N: usize> {
-    hci: Arc<Xhci<N>>,
+pub struct IrqReactor {
+    hci: Arc<Xhci>,
     irq_file: Option<File>,
     irq_receiver: Receiver<NewPendingTrb>,
     device_enumerator_sender: Sender<DeviceEnumerationRequest>,
@@ -104,8 +104,8 @@ pub struct IrqReactor<const N: usize> {
 
 pub type NewPendingTrb = State;
 
-impl<const N: usize> IrqReactor<N> {
-    pub fn new(hci: Arc<Xhci<N>>, irq_file: Option<File>) -> Self {
+impl IrqReactor {
+    pub fn new(hci: Arc<Xhci>, irq_file: Option<File>) -> Self {
         let device_enumerator_sender = hci.device_enumerator_sender.clone();
         let irq_receiver = hci.irq_reactor_receiver.clone();
 
@@ -121,7 +121,7 @@ impl<const N: usize> IrqReactor<N> {
     fn pause(&self) {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    fn run_polling(mut self) -> ! {
+    fn run_polling(mut self) {
         debug!("Running IRQ reactor in polling mode.");
         let hci_clone = Arc::clone(&self.hci);
 
@@ -204,11 +204,11 @@ impl<const N: usize> IrqReactor<N> {
         run.ints[0].iman.writef(1 << 1, true);
     }
 
-    fn run_with_irq_file(mut self) -> ! {
+    fn run_with_irq_file(mut self) {
         debug!("Running IRQ reactor with IRQ file and event queue");
 
         let hci_clone = Arc::clone(&self.hci);
-        let event_queue =
+        let mut event_queue =
             RawEventQueue::new().expect("xhcid irq_reactor: failed to create IRQ event queue");
         let irq_fd = self.irq_file.as_ref().unwrap().as_raw_fd();
         event_queue
@@ -226,8 +226,7 @@ impl<const N: usize> IrqReactor<N> {
         };
 
         trace!("IRQ reactor has grabbed the next index in the event ring.");
-        'trb_loop: loop {
-            let _event = event_queue.next_event().unwrap();
+        for _event in event_queue {
             trace!("IRQ event queue notified");
             let mut buffer = [0u8; 8];
 
@@ -241,7 +240,7 @@ impl<const N: usize> IrqReactor<N> {
             if !self.hci.received_irq() {
                 // continue only when an IRQ to this device was received
                 trace!("no interrupt pending");
-                continue 'trb_loop;
+                break;
             }
 
             self.mask_interrupts();
@@ -266,7 +265,7 @@ impl<const N: usize> IrqReactor<N> {
                     }
                     //hci_clone.event_handler_finished();
                     self.unmask_interrupts();
-                    continue 'trb_loop;
+                    return;
                 } else {
                     count += 1
                 }
@@ -288,7 +287,7 @@ impl<const N: usize> IrqReactor<N> {
                         debug!("The interrupt bit is no longer pending.");
                     }
                     self.unmask_interrupts();
-                    continue 'trb_loop;
+                    return;
                 }
                 self.handle_requests();
 
@@ -310,7 +309,9 @@ impl<const N: usize> IrqReactor<N> {
 
                 event_trb_index = event_ring.ring.next_index();
             }
+            trace!("Exited event loop!");
         }
+        trace!("IRQ Reactor has finished handling the interrupt");
     }
 
     /// Handles device attach/detach events as indicated by a PortStatusChange
@@ -332,16 +333,7 @@ impl<const N: usize> IrqReactor<N> {
                 );
             {
                 let mut ports = self.hci.ports.lock().unwrap();
-                let root_port_index = port_id.root_hub_port_index();
-                if root_port_index >= ports.len() {
-                    warn!(
-                        "Received out of bounds transmit device numeration request on root index {} at port {} [port len was: {}]",
-                        root_port_index, port_id, ports.len()
-                    );
-                    return;
-                }
-
-                let port = &mut ports[root_port_index];
+                let port = &mut ports[port_id.root_hub_port_index()];
                 port.clear_csc();
             }
         } else {
@@ -537,7 +529,7 @@ impl<const N: usize> IrqReactor<N> {
         error!("TODO: grow event ring");
     }
 
-    pub fn run(self) -> ! {
+    pub fn run(mut self) {
         if self.irq_file.is_some() {
             self.run_with_irq_file();
         } else {
@@ -559,7 +551,7 @@ pub struct EventDoorbell {
 }
 
 impl EventDoorbell {
-    pub fn new<const N: usize>(hci: &Xhci<N>, index: usize, data: u32) -> Self {
+    pub fn new(hci: &Xhci, index: usize, data: u32) -> Self {
         Self {
             //TODO: simplify this logic, maybe just use a raw pointer?
             dbs: hci.dbs.clone(),
@@ -625,7 +617,7 @@ impl Future for EventTrbFuture {
     }
 }
 
-impl<const N: usize> Xhci<N> {
+impl Xhci {
     pub fn get_transfer_trb(&self, paddr: u64, id: RingId) -> Option<Trb> {
         self.with_ring(id, |ring| ring.phys_addr_to_entry(self.cap.ac64(), paddr))
             .flatten()

@@ -148,7 +148,7 @@ fn daemon_with_context_size<const N: usize>(
     daemon.ready();
 
     let hci = Arc::new(
-        Xhci::<N>::new(scheme_name, address, interrupt_method, pcid_handle)
+        Xhci::new(scheme_name, address, interrupt_method, pcid_handle)
             .expect("xhcid: failed to allocate device"),
     );
 
