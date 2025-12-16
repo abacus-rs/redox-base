@@ -106,8 +106,15 @@ impl<const N: usize> DeviceEnumerator<N> {
                         );
                     }
                 }
+     let block = {
+                let start = crate::xhci::start();
+                let res = self.hci.attach_device(port_id);
+                let stop = crate::xhci::stop();
+                crate::xhci::log_cycle_difference_with_name("attach_device", start, stop);
+                res
+            };
 
-                let result = futures::executor::block_on(self.hci.attach_device(port_id));
+                let result = futures::executor::block_on(block);
                 match result {
                     Ok(_) => {
                         info!("Device on port {} was attached", port_id);
